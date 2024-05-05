@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<!-- 
+This software is provided under the BSD License. Copyright (c) 2024 Xavier de Carné de Carnavalet.
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the original author is acknowledged. See JavaScript source for full license text.
+-->
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Application</title>
+    <!-- Bootstrap CSS for styling -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <!-- Custom CSS -->
+    <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
+</head>
+<body>
+<div class="container mt-4">
+    <h2>Chat Application <small> - (<a href="/logout" id="logoutLink">Logout</a>)</small></h2>
+    <div class="chat-box">
+        <!-- Chat messages container -->
+        <div id="messages" style="border:1px solid #ccc; height:300px; margin-bottom:20px; overflow-y:scroll; padding:10px;"></div>
+        <!-- User selection dropdown -->
+        <select id="userList" class="form-control mb-2">
+            <option value="-1" disabled selected><i>Choose a contact</i></option>
+            <!-- User options populated here -->
+        </select>
+        <!-- Message input -->
+        <textarea id="messageInput" class="form-control mb-2" placeholder="Type a message..."></textarea>
+        <div class="d-flex justify-content-between">
+            <button onclick="sendMessage()" class="btn btn-primary">Send</button>
+            <div>
+                <button onclick="refreshKeys()" class="btn btn-secondary btn-sm">Refresh Keys</button>
+                <button onclick="eraseChat()" class="btn btn-danger btn-sm">Erase Chat</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs" crossorigin="anonymous"></script>
+<script type="text/javascript">
+// Global variables
+let lastMessageId = -1;
+let peer_id = -1;
+const myID = {{ sender_id }};
+let userInfo = {};
+let userPrivateKey;
+let sharedSecrets = {}; 
+let ivCounters = {};
+let keynum = 1;
+
+
+async function fetchAndSetupEncryptionWithPeer(peerId) {
+    const peerPublicKey = await fetchPeerPublicKey(peerId);
+    const importedPeerPublicKey = await window.crypto.subtle.importKey(
+        "spki",
+        peerPublicKey, // Ensure this is an ArrayBuffer
+        { name: "ECDH", namedCurve: "P-384" },
+        false,
+        []
+    );
+
+    const sharedSecret = await window.crypto.subtle.deriveBits(
+        { name: "ECDH", public: importedPeerPublicKey },
+        userPrivateKey,
+        384
+    );
+}
+
+
+
+async function GenerateKeypair() {
+
+        const keyPair = await window.crypto.subtle.generateKey(
+            {
+                name: "ECDH",
+                namedCurve: "P-384"
+            },
+            true, 
+            ["deriveKey", "deriveBits"]
+        );
+
+        // Export the private key and store it in localStorage
+        const exportedPrivateKey = await window.crypto.subtle.exportKey(
+            "pkcs8",
+            keyPair.privateKey
+        );
+        const privateKeyBase64 = window.btoa(String.fromCharCode(...new Uint8Array(exportedPrivateKey)));
+        localStorage.setItem('privateKey', privateKeyBase64);
+        console.log('Generated private key:', privateKeyBase64); 
+
+        // Export the public key, convert it to Base64, and prepare to send it to the server
+        const exportedPublicKey = await window.crypto.subtle.exportKey(
+            "spki",
+            keyPair.publicKey
+        );
+        const publicKeyBase64 = window.btoa(String.fromCharCode(...new Uint8Array(exportedPublicKey)));
+        console.log('Generated public key :', publicKeyBase64);//test
+        // Send the public key to the server
+        
+        const response = await fetch('/update_public_key', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+               
+            },
+            body: JSON.stringify({ public_key: publicKeyBase64 }),
+        });
+
+        if (!response.ok) {
+            throw new Error('Failed to send public key to server');
+        }
+        console.log('Public key sent successfully');
+}
+
+// Call the function to check for an existing private key or generate a new one
+
+if (!localStorage.getItem('privateKey')){
+    GenerateKeypair().catch(console.error);
+    console.log("no privateKey found in localstorage, regenerate new keykepar!");
+}
+if (!localStorage.getItem('keynum')){
+    console.log("No chat history.");
+} else {
+    keynum = localStorage.getItem('keynum');
+}
+
+let info = 'none';
+let macinfo = 'none';
+
+async function deriveKeys(sharedSecretBits, salt, peer_id) {
+    // Import the raw shared secret bits as a CryptoKey for use with HKDF
+    const sharedSecretKey = await window.crypto.subtle.importKey(
+        "raw",
+        sharedSecretBits,
+        { name: "HKDF" },
+        false,
+        ["deriveKey"]
+    );
+
+
+    if (myID < peer_id) {
+    info = `CHAT_KEY_USER${myID}to${peer_id}`;
+    macinfo = `CHAT_MAC_USER${myID}to${peer_id}`;
+    console.log("key info generated:",info,",mac info generated:",macinfo);
+    } else if (myID > peer_id) {
+        info = `CHAT_KEY_USER${peer_id}to${myID}`;
+        macinfo = `CHAT_MAC_USER${peer_id}to${myID}`;
+        console.log("key info generated:",info,",mac info generated:",macinfo);
+    } else {
+    console.error("error when comparing peer_id and myID")
+    }
+
+
+    // Derive the AES-GCM encryption key
+    const aesKey = await window.crypto.subtle.deriveKey(
+        {
+            name: "HKDF",
+            salt: hexToArrayBuffer(localStorage.getItem("salt")),
+            info: new TextEncoder().encode(info),
+            hash: "SHA-256"
+        },
+        sharedSecretKey,
+        { name: "AES-GCM", length: 256 },
+        true, ["encrypt", "decrypt"]
+    );
+
+    // Derive the HMAC key
+    const macKey = await window.crypto.subtle.deriveKey(
+        {
+            name: "HKDF",
+            salt: hexToArrayBuffer(localStorage.getItem("salt")),
+            info: new TextEncoder().encode(macinfo),
+            hash: "SHA-256"
+        },
+        sharedSecretKey, 
+        { name: "HMAC", hash: "SHA-256" },
+        true, ["sign", "verify"]
+    );
+
+    console.log("Derived AES Key:", aesKey);
+    console.log("Derived MAC Key:", macKey);
+
+    return { aesKey, macKey };
+}
+
+function incrementUint8Array(value) {
+    for (let i = value.length - 1; i >= 0; i--) {
+        if (++value[i]) { 
+            break;
+        }
+    }
+}
+if(!localStorage.getItem("salt")){
+        salt = new Uint8Array(16);
+        localStorage.setItem("salt",arrayBufferToHex(salt));
+    }
+    else{
+        salt = hexToArrayBuffer(localStorage.getItem("salt"));
+    }
+
+async function startKeyDerivation() {
+    const sharedSecret = await deriveSharedSecret(); 
+    console.log("salt:",arrayBufferToHex(salt))
+    const { aesKey, macKey } = await deriveKeys(sharedSecret, salt, peer_id);
+    storeKeys(aesKey,macKey,peer_id); 
+}
+
+
+async function generateIV() {
+    const latestIVResponse = await fetch(`/api/latest_iv/${peer_id}`);
+    const responseData = await latestIVResponse.json();
+    let latestIVBase64 = responseData.iv;
+    
+    // Decode Base64 IV to bytes
+    let ivBytes;
+    try {
+        ivBytes = Uint8Array.from(atob(latestIVBase64), c => c.charCodeAt(0));
+
+    } catch (error) {
+        console.error("Error decoding IV from Base64:", error);
+        ivBytes = new Uint8Array(12);
+    }
+    
+    // Increment the IV
+    for (let i = 11; i >= 0; i--) {
+        if (ivBytes[i] < 255) {
+            ivBytes[i]++;
+            break;
+        } else if (i > 0) {
+            ivBytes[i] = 0;
+        } else {
+            ivBytes[i] = 0;
+        }
+    }
+    const incrementedIVBase64 = arrayBufferToBase64(ivBytes)
+    return incrementedIVBase64;
+}
+
+// Assuming aesKey and macKey are already derived and available
+async function storeKeys(aesKey, macKey, peer_id) {
+    // Export the AES-GCM encryption key
+    const aesKeyExported = await window.crypto.subtle.exportKey("jwk", aesKey);
+    // Export the HMAC key
+    const macKeyExported = await window.crypto.subtle.exportKey("jwk", macKey);
+
+    // Serialize and store in Local Storage
+    localStorage.setItem(`${info}`, JSON.stringify(aesKeyExported));
+    localStorage.setItem(`${macinfo}`, JSON.stringify(macKeyExported));
+    // Store peer_id
+    localStorage.setItem('peer_id', peer_id);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('userList').addEventListener('change', function() {
+        const selectedUserId = this.value;
+        localStorage.setItem('peer_id', selectedUserId);
+    });
+
+});
+
+async function sendMessage() {
+    // Retrieve peer_id and the keys from Local Storage
+    const peer_id = localStorage.getItem('peer_id');
+    if (!peer_id) {
+        console.error("No receiver selected or peer_id missing in Local Storage.");
+        return;
+    }
+    const associatedData = `CHAT_MSG_FROM_${myID}_TO_${peer_id}`
+
+    const aesKeyJwk = JSON.parse(localStorage.getItem(`${info}`));
+    const macKeyJwk = JSON.parse(localStorage.getItem(`${macinfo}`));
+    if (!aesKeyJwk || !macKeyJwk) {
+        console.error("Encryption or MAC key missing in Local Storage.");
+        return;
+    }
+
+    // Import the keys back into CryptoKey objects for encryption and signing
+    const aesKey = await window.crypto.subtle.importKey("jwk", aesKeyJwk, { name: "AES-GCM" }, false, ["encrypt"]);
+    const macKey = await window.crypto.subtle.importKey("jwk", macKeyJwk, { name: "HMAC", hash: { name: "SHA-256" } }, false, ["sign"]);
+
+    const inputMessage = document.getElementById('messageInput').value;
+
+    // Escape message
+    const escapeHtml = (unsafe) => {
+        return unsafe.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+    }
+
+    const message = escapeHtml(inputMessage);
+
+    if (!message) {
+        console.error("No message to send.");
+        return;
+    }
+
+    // Generate a unique IV and prepare AAD
+    const ivb64 = await generateIV();
+    const iv = base64ToArrayBuffer(ivb64);
+    const encoder = new TextEncoder();
+    const AAD = encoder.encode(associatedData);
+    // Encrypt the message
+    const encryptedData = await window.crypto.subtle.encrypt(
+        {
+            name: "AES-GCM",
+            iv: iv,
+            additionalData: AAD,
+        },
+            aesKey, encoder.encode(message)
+    );
+
+    // Sign the IV with HMAC to ensure its integrity
+    const hmacSignature = await window.crypto.subtle.sign("HMAC", macKey, iv);
+
+    // Convert encrypted data and HMAC signature to Base64 for sending
+    const encryptedDataB64 = arrayBufferToBase64(encryptedData);
+    const hmacSignatureB64 = arrayBufferToBase64(hmacSignature);
+    iv_hex = arrayBufferToHex(iv)
+    hmac_hex = arrayBufferToHex(hmacSignature)
+
+    console.log("[+] Message:",message,",iv=",iv_hex,",hmac=",hmac_hex,",ciphertext=",encryptedDataB64,",associatedData=",associatedData);
+
+    // Send the iv,encrypted message and HMAC signature to the server
+    const response = await fetch('/api/send_message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            peer_id: peer_id,
+            ciphertext: encryptedDataB64,
+            iv: arrayBufferToBase64(iv),
+            hmac: hmacSignatureB64,
+            aad: associatedData,
+        }),
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok');
+        }
+        return response.json(); 
+    })
+    .then(data => {
+        console.log('Message sent:', data); // Log success message
+        document.getElementById('messageInput').value = ''; // Clear the input after sending
+    })
+    .catch(error => {
+        console.error('Error sending message:', error); // Log any errors
+    });
+}
+
+//convert Base64 to ArrayBuffer
+function base64ToArrayBuffer(base64) {
+    const binaryString = window.atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
+// convert ArrayBuffer to Base64
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+}
+
+
+// Refresh Keys function
+function refreshKeys() {
+    incrementUint8Array(salt);  //salt ++
+    localStorage.setItem("salt",arrayBufferToHex(salt));
+    const aesKey=localStorage.getItem(`${info}`);
+    const macKey=localStorage.getItem(`${macinfo}`);
+    localStorage.setItem(`${info}_${keynum}`,aesKey);
+    localStorage.setItem(`${macinfo}_${keynum}`,macKey);
+    localStorage.setItem('keynum',keynum) 
+    keynum++;
+    startKeyDerivation();
+    sendspecialMessage();
+
+}
+
+async function sendspecialMessage(){
+    const peer_id = localStorage.getItem('peer_id');
+    if (!peer_id) {
+        console.error("No receiver selected or peer_id missing in Local Storage.");
+        return;
+    }
+    const associatedData = `CHAT_MSG_FROM_${myID}_TO_${peer_id}`
+
+    const aesKeyJwk = JSON.parse(localStorage.getItem(`${info}`));
+    const macKeyJwk = JSON.parse(localStorage.getItem(`${macinfo}`));
+    if (!aesKeyJwk || !macKeyJwk) {
+        console.error("Encryption or MAC key missing in Local Storage.");
+        return;
+    }
+
+    // Import the keys back into CryptoKey objects for encryption and signing
+    const aesKey = await window.crypto.subtle.importKey("jwk", aesKeyJwk, { name: "AES-GCM" }, false, ["encrypt"]);
+    const macKey = await window.crypto.subtle.importKey("jwk", macKeyJwk, { name: "HMAC", hash: { name: "SHA-256" } }, false, ["sign"]);
+
+    const message = "Keys changed";
+    // Generate a unique IV and prepare AAD
+    const ivb64 = await generateIV();
+    const iv = base64ToArrayBuffer(ivb64);
+    const encoder = new TextEncoder();
+    const AAD = encoder.encode(associatedData);
+    // Encrypt the message
+    const encryptedData = await window.crypto.subtle.encrypt(
+        {
+            name: "AES-GCM",
+            iv: iv,
+            additionalData: AAD,
+        },
+            aesKey, encoder.encode(message)
+    );
+
+    // Sign the IV with HMAC to ensure its integrity
+    const hmacSignature = await window.crypto.subtle.sign("HMAC", macKey, iv);
+
+    // Convert encrypted data and HMAC signature to Base64 for sending
+    const encryptedDataB64 = arrayBufferToBase64(encryptedData);
+    const hmacSignatureB64 = arrayBufferToBase64(hmacSignature);
+    iv_hex = arrayBufferToHex(iv)
+    hmac_hex = arrayBufferToHex(hmacSignature)
+
+    console.log("Message:",message,",iv=",iv_hex,",hmac=",hmac_hex,",ciphertext=",encryptedDataB64,",associatedData=",associatedData);
+
+    // Send the iv,encrypted message and HMAC signature to the server
+    const response = await fetch('/api/send_message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            peer_id: peer_id,
+            ciphertext: encryptedDataB64,
+            iv: arrayBufferToBase64(iv),
+            hmac: hmacSignatureB64,
+            aad: associatedData,
+        }),
+    })
+    .then(response => {
+        if (!response.ok) {
+            // If the server response is not OK, throw an error
+            throw new Error('Network response was not ok');
+        }
+        return response.json(); // Parse JSON response from the server
+    })
+    .then(data => {
+        console.log('Message sent:', data); // Log success message
+        document.getElementById('messageInput').value = ''; // Clear the input after sending
+    })
+    .catch(error => {
+        console.error('Error sending message:', error); // Log any errors
+    });
+}
+// Populate users function
+function populateUsers(users) {
+    const userListDropdown = document.getElementById("userList");
+    users.forEach(user => {
+        const option = new Option(user[1], user[0]); // username as text, user_id as value
+        userListDropdown.add(option);
+    });
+}
+
+// Fetch users from server
+$(document).ready(function() {
+    fetch('/users')
+        .then(response => response.json())
+        .then(data => {
+            data.users.forEach(user => {
+                userInfo[user[0]] = user[1]; // Map user_id to username
+            });
+            console.log(userInfo);
+            populateUsers(data.users);
+        })
+        .catch(error => console.error('Error fetching user info:', error));
+});
+
+// Handle user selection change
+document.getElementById('userList').addEventListener('change', async(event) => {
+    peer_id = parseInt(event.target.value, 10); // Convert selected peer_id to integer
+    console.log("peer changed:", peer_id);
+    try {
+        const response = await fetch(`/get_public_key/${peer_id}`);
+        if (!response.ok) {
+            throw new Error('Failed to fetch public key');
+        }
+        const data = await response.json();
+        console.log('Public Key:', data.public_key);
+
+        // Store the fetched public key in localStorage
+        localStorage.setItem(`publicKey_${peer_id}`, data.public_key);
+        if(!localStorage.getItem(`${info}`) || !localStorage.getItem(`${macinfo}`)) {
+            console.log("No aeskey/mackey found in localstorage, regenerate.")
+            startKeyDerivation();
+        }
+        // Proceed to setup encryption or any other necessary steps
+    } catch (error) {
+        console.error('Error fetching public key:', error);
+    }
+    
+    clearChatBox();
+});
+
+async function deriveSharedSecret() {
+    // Retrieve the Base64-encoded keys from localStorage
+    const privateKeyBase64 = localStorage.getItem('privateKey');
+    const peerPublicKeyBase64 = localStorage.getItem(`publicKey_${peer_id}`);
+    const privateKeyArrayBuffer = base64ToArrayBuffer(privateKeyBase64);
+    const peerPublicKeyArrayBuffer = base64ToArrayBuffer(peerPublicKeyBase64);
+    
+    const privateKey = await window.crypto.subtle.importKey(
+        "pkcs8",
+        privateKeyArrayBuffer,
+        {
+            name: "ECDH",
+            namedCurve: "P-384"
+        },
+        false, 
+        ["deriveKey", "deriveBits"] 
+    );
+    // Import the peer's public key
+    const peerPublicKey = await window.crypto.subtle.importKey(
+        "spki",
+        peerPublicKeyArrayBuffer,
+        {
+            name: "ECDH",
+            namedCurve: "P-384" 
+        },
+        false, 
+        [] 
+    );
+
+    // Derive the shared secret
+    const sharedSecret = await window.crypto.subtle.deriveKey(
+        {
+            name: "ECDH",
+            public: peerPublicKey 
+        },
+        privateKey, 
+        {
+            name: "AES-GCM",
+            length: 256, 
+        },
+        false, 
+        ["encrypt", "decrypt"] 
+    );
+        //derive it as raw 
+    const bits = await window.crypto.subtle.deriveBits(
+        {
+            name: "ECDH",
+            public: peerPublicKey 
+        },
+        privateKey, 
+        256
+    );
+    const hashBuffer = await window.crypto.subtle.digest(
+        {
+            name: "SHA-256"
+        },
+        bits 
+    );
+
+    // Convert the hash for transit
+    const sharedsecret_hex = arrayBufferToHex(hashBuffer);
+
+    console.log("Shared secret: ", sharedsecret_hex);
+
+    return bits;
+    //return sharedSecret;
+}
+
+function arrayBufferToHex(buffer) {
+    const byteArray = new Uint8Array(buffer);
+    const hexString = byteArray.reduce((str, byte) => str + byte.toString(16).padStart(2, '0'), '');
+    return hexString;
+}
+
+function hexToArrayBuffer(hex) {
+    if (hex.length % 2 !== 0) {
+        console.error('The hexadecimal string should have an even length');
+        return null;
+    }
+    const buffer = new ArrayBuffer(hex.length / 2);
+    const byteView = new Uint8Array(buffer);
+    for (let i = 0; i < hex.length; i += 2) {
+        byteView[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+    }
+    return buffer;
+}
+
+// Clear chat box
+function clearChatBox() {
+    document.getElementById('messages').innerHTML = '';
+}
+
+// Fetch messages from server
+function fetchMessages() {
+    if (peer_id === -1) {
+        return; // Exit if no peer selected
+    }
+    fetch(`/fetch_messages?last_message_id=${lastMessageId}&peer_id=${peer_id}`)
+        .then(response => response.json())
+        .then(data => {
+            // Sort messages by IV before processing
+            const sortedMessages = data.messages.sort((a, b) => {
+                const ivA = atob(a.iv); // Decode from Base64 to binary string for comparison
+                const ivB = atob(b.iv);
+                return ivA.localeCompare(ivB); // Compare the decoded binary strings
+            });
+
+            sortedMessages.forEach(message => {
+                displayMessage(message);
+                lastMessageId = message.message_id;
+            });
+        })
+        .catch(error => console.error('Error fetching messages:', error));
+}
+async function decryptMessage(encryptedMessage, aesKey, macKey) {
+    // Convert IV, HMAC, and ciphertext from Base64 to ArrayBuffer
+    
+    const ivArrayBuffer = base64ToArrayBuffer(encryptedMessage.iv);
+    const hmacArrayBuffer = base64ToArrayBuffer(encryptedMessage.hmac);
+    const ciphertextArrayBuffer = base64ToArrayBuffer(encryptedMessage.ciphertext);
+    const iv_hex = arrayBufferToHex(ivArrayBuffer); // Convert IV to hex for logging
+    const hmac_hex = arrayBufferToHex(hmacArrayBuffer); // Convert HMAC to hex for logging
+
+    // Verify IV HMAC to ensure it hasn't been tampered with
+    const isHmacValid = await window.crypto.subtle.verify(
+        "HMAC",
+        macKey,
+        hmacArrayBuffer, // The HMAC signature from the message
+        ivArrayBuffer // The IV used for encryption
+    );
+    
+    if (!isHmacValid) {
+        throw new Error("HMAC verification failed");
+    }
+    const encoder = new TextEncoder();
+    const AAD = encoder.encode(encryptedMessage.aad);
+    //console.log("AAD:",encryptedMessage.aad);
+    // Decrypt the message
+    const decryptedData = await window.crypto.subtle.decrypt(
+        {
+        name: "AES-GCM",
+        iv: ivArrayBuffer, 
+        additionalData: AAD, 
+    },
+        aesKey,
+        ciphertextArrayBuffer,
+    );
+    const plaintext = new TextDecoder().decode(decryptedData);
+    if(encryptedMessage.sender_id != myID)console.log("[+] Plaintext:", plaintext, ",Hmac_Valid=", isHmacValid, ",iv=", iv_hex, ",hmac=", hmac_hex, ",ciphertext=", encryptedMessage.ciphertext, ",associatedData=", encryptedMessage.aad);
+    if(plaintext == "Keys changed" && encryptedMessage.sender_id != myID){
+        incrementUint8Array(salt);  //salt ++
+        localStorage.setItem("salt",arrayBufferToHex(salt));
+        //store current pair of keys into the localstorage?
+        const aesKey=localStorage.getItem(`${info}`);
+        const macKey=localStorage.getItem(`${macinfo}`);
+        localStorage.setItem(`${info}_${keynum}`,aesKey);
+        localStorage.setItem(`${macinfo}_${keynum}`,macKey);
+        localStorage.setItem('keynum',keynum) //latestkeynum
+        keynum++;
+        startKeyDerivation();
+    }
+    return plaintext;
+}
+//enumerate history key stored in localstorage
+async function tryDecryptWithHistoricalKeys(encryptedMessage) {
+    let decryptionSuccessful = false;
+    end = localStorage.getItem('keynum') || 0;
+    for (let i = 0; i <= end; i++) {
+        const aesKeyName = i === 0 ? info : `${info}_${i}`;
+        const macKeyName = i === 0 ? macinfo : `${macinfo}_${i}`;        
+        const aesKeyJwk = JSON.parse(localStorage.getItem(aesKeyName));
+        const macKeyJwk = JSON.parse(localStorage.getItem(macKeyName));
+        
+        if (!aesKeyJwk || !macKeyJwk) {
+            console.log(`Key pair not found for index ${i}. Skipping.`);
+            continue;
+        }
+
+        const aesKey = await window.crypto.subtle.importKey("jwk", aesKeyJwk, { name: "AES-GCM" }, true, ["decrypt"]);
+        const macKey = await window.crypto.subtle.importKey("jwk", macKeyJwk, { name: "HMAC", hash: { name: "SHA-256" } }, true, ["verify"]);
+
+        try {
+            const plaintext = await decryptMessage(encryptedMessage, aesKey, macKey);
+            decryptionSuccessful = true;
+            return plaintext;
+        } catch (error) {
+        }
+    }
+
+    if (!decryptionSuccessful) {
+        console.warn("Decryption failed with all available keys.");
+        throw new Error("Decryption failed with all available keys.");
+    }
+}
+
+// Main function to display the message
+async function displayMessage(message) {
+    let plaintext;
+    const sender = message.sender_id == myID ? "me" : (userInfo[message.sender_id] || `User ${message.sender_id}`);
+    const receiver = message.receiver_id == myID ? "me" : (userInfo[message.receiver_id] || `User ${message.receiver_id}`);
+
+    if (message.iv && message.hmac && message.ciphertext) {
+        try {
+            plaintext = await tryDecryptWithHistoricalKeys(message);
+        } catch (error) {
+            plaintext = "⚠️ This message could not be decrypted.";
+        }
+    } else {
+        plaintext = message.text; // Non-encrypted message case
+    }
+
+    appendMessageToChat(sender, receiver, plaintext, !message.iv);
+}
+
+function appendMessageToChat(sender, receiver, plaintext, isWarning = false) {
+    const messagesContainer = document.getElementById('messages');
+    const messageElement = document.createElement('div');
+    if (isWarning) {
+        messageElement.style.color = 'red'; // Style warning messages differently, if desired
+    }
+    messageElement.textContent = `From ${sender} to ${receiver}: ${plaintext}`;
+    messagesContainer.appendChild(messageElement);
+}
+
+
+// Periodically fetch new messages every second
+setInterval(fetchMessages, 500);
+
+// Erase Chat function using fetch API
+function eraseChat() {
+    if (peer_id === -1) return; // Exit if no peer selected
+    if (!confirm('Are you sure you want to erase the chat with '+userInfo[peer_id]+'?')) return; // Confirmation before erasing
+
+    fetch(`/erase_chat`, {
+        method: 'POST',  
+        headers: {
+            'Content-Type': 'application/json', 
+        },
+        body: JSON.stringify({ peer_id: peer_id })
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok');
+        }
+        return response.json(); // Assuming the server responds with JSON
+    })
+    .then(data => {
+        console.log('Chat erased:', data);
+        clearChatBox(); // Clear the chat display
+    })
+    .catch(error => {
+        console.error('Error erasing chat:', error);
+    });
+}
+
+document.addEventListener('DOMContentLoaded', function() { //clear cache when logout
+    
+    const logoutLink = document.getElementById('logoutLink');
+    if (logoutLink) {
+        logoutLink.addEventListener('click', function(e) {
+            // Prevent the default link behavior
+            e.preventDefault();
+            // Clear localStorage
+            localStorage.clear();
+            console.log('Logged out. Local storage cleared.');
+            window.location.href = '/logout';
+        });
+    }
+});
+
+function setupInactivityTimer() {  //set timer for checking session expired (20 minuts no click)
+    let inactivityTimer;
+    function sendInactivityNotice() {
+        fetch('/api/sessionReset')
+            .then(response => {
+                if (response.ok) {
+                    console.log('Inactivity notice sent successfully.');
+                    return response.json();
+                }
+                throw new Error('Failed to fetch from server');
+            })
+            .then(data => console.log('Server response:', data.message))
+            .catch(error => console.error('Error sending inactivity notice:', error));
+    }
+    // Reset the timer <- when the mouse is clicked
+    function resetInactivityTimer() {
+        clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(sendInactivityNotice, 20 * 60 * 1000);  // 20 minutes
+    }
+    // Set up the event listener for mouse clicks
+    document.addEventListener('click', resetInactivityTimer);
+    resetInactivityTimer();
+}
+
+setupInactivityTimer();
+
+
+
+
+</script>
+</body>
+</html>
+
